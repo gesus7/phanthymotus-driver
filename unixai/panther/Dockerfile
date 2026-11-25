@@ -56,7 +56,7 @@ RUN test -s /usr/share/keyrings/ros2-archive-keyring.gpg || \
         ros-humble-rmw-cyclonedds-cpp ros-humble-rmw-fastrtps-cpp \
         ros-humble-std-msgs ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-diagnostic-msgs \
         ros-humble-geometry-msgs ros-humble-tf2-msgs ros-humble-trajectory-msgs \
-        ros-humble-control-msgs ros-humble-controller-manager-msgs; do \
+        ros-humble-control-msgs ros-humble-controller-manager-msgs ros-humble-moveit-msgs; do \
         if [ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" != "install ok installed" ]; then \
             missing="$missing $package"; \
         fi; \
@@ -75,7 +75,7 @@ COPY --from=interface-builder /panther_ws/install /panther_ws/install
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py contracts.py host_camera.py panther_motion.py panther_payloads.py panther_bridge.py config.yaml driver.yaml /work/unixai/panther/
+COPY main.py device.py contracts.py host_camera.py panther_motion.py panther_payloads.py panther_bridge.py tabletop_pick.py config.yaml driver.yaml /work/unixai/panther/
 COPY resource/panther.urdf /work/unixai/panther/resource/panther.urdf
 COPY deploy/ /deploy/
 

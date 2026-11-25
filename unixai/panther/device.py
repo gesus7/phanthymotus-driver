@@ -15,10 +15,12 @@ listed and answer `info`, and every motion command is refused.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
 import xml.etree.ElementTree as ET
+from collections import deque
 from pathlib import Path
 
 from common.camera_info import build as build_camera_info
@@ -28,10 +30,11 @@ from contracts import parse_joint_limits, populate_switch_request
 from host_camera import HostCamera
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
 from panther_motion import MOTION_CARDS, Motion, motion_tools
+from tabletop_pick import CARD as PICK_CARD, TabletopPick, VopInput
 from panther_payloads import (
     DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, StaticTf, UnsupportedImage, battery_payload, diagnostic_entries,
     encode_color_jpeg, encode_depth_zlib, estop_payload, health_payload, imu_payload,
-    joint_state_payload, laser_topdown_jpeg, merge_scans, odom_reading, single_joint,
+    joint_state_payload, laser_topdown_jpeg, merge_scans, odom_reading, single_joint, stamp_ms,
 )
 
 URDF_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -43,7 +46,7 @@ CAMERA_ID = "unixai/panther/{}"
 # on a Jetson that is also running the robot.
 CAMERA_CARDS = ("camera_color", "camera_depth")
 SENSOR_CARDS = ("model", "joints", "imu", "odom", "robot_state", "laser_scan") + CAMERA_CARDS
-CARD_ORDER = SENSOR_CARDS + MOTION_CARDS
+CARD_ORDER = SENSOR_CARDS + MOTION_CARDS + (PICK_CARD,)
 STREAM_CARDS = tuple(c for c in SENSOR_CARDS if c != "model")
 
 DESCRIPTIONS = {
@@ -146,6 +149,9 @@ class Hub:
         self._latest: dict = {}                 # battery, gripper_left/right, lift: (seen, record)
         self._odom_burst: list = []
         self._odom_meta: dict = {}
+        self._pick_odom = deque(maxlen=128)
+        self._pick_frames = {name: deque(maxlen=24) for name in CAMERA_CARDS}
+        self._pick_enabled = bool((self._config.get("plugins", {}).get(PICK_CARD) or {}).get("enabled", False))
         self._diag: dict = {}
         self._diag_seen = None
         self._diag_signature = None
@@ -286,6 +292,8 @@ class Hub:
         with self._lock:
             self._odom_burst.append(reading)
             self._odom_meta = meta
+            if self._pick_enabled:
+                self._pick_odom.append((self._mono(), (reading[0], reading[1], reading[5])))
         if not self._due("odom", self._rates["odom"]):
             return
         with self._lock:
@@ -551,6 +559,7 @@ class Hub:
 
     def _image(self, card: str, msg) -> None:
         self._rx(card)
+        received = self._mono()
         if not self.is_active(card) or not self._due(card, self._rates[card]):
             return
         frame_id = str(getattr(getattr(msg, "header", None), "frame_id", ""))
@@ -579,7 +588,43 @@ class Hub:
             return
         self._image_info[card] = {"width": size[0], "height": size[1], "encoding": encoding,
                                   "source_width": source[0], "source_height": source[1]}
+        stamp = stamp_ms(getattr(msg, "header", None))
+        if self._pick_enabled and stamp is not None:
+            sample = {"received": received, "stamp": stamp, "size": size, "frame": frame_id,
+                      "sha256": hashlib.sha256(data).hexdigest() if card == "camera_color" else None,
+                      "data": data if card == "camera_depth" else None}
+            with self._lock:
+                self._pick_frames[card].append(sample)
         self._emit_image(card, card, self.topics[card]["topic"], image_format, data, frame_id)
+
+    def pick_frames(self, digest, max_age, max_skew):
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ValueError("streaming VOP must include frame_sha256")
+        if not all(self.is_active(card) for card in CAMERA_CARDS):
+            raise ValueError("start both Panther camera cards before tabletop_pick")
+        with self._lock:
+            now = self._mono()
+            rgb = next((sample for sample in reversed(self._pick_frames["camera_color"])
+                        if sample["sha256"] == digest and now - sample["received"] <= max_age), None)
+            candidates = [sample for sample in self._pick_frames["camera_depth"]
+                          if now - sample["received"] <= max_age]
+        if rgb is None or not candidates:
+            raise ValueError("no fresh RGB-D observation matches VOP")
+        depth = min(candidates, key=lambda sample: abs(sample["stamp"] - rgb["stamp"]))
+        if (abs(depth["stamp"] - rgb["stamp"]) > max_skew * 1000
+                or abs(depth["received"] - rgb["received"]) > max_skew
+                or not rgb["frame"]):
+            raise ValueError("no synchronized and stamped depth frame matches VOP")
+        return rgb, depth
+
+    def pick_base_still(self):
+        with self._lock:
+            now = self._mono()
+            recent = [(when, twist) for when, twist in self._pick_odom if now - when <= 0.5]
+        return (len(recent) >= 2 and now - recent[-1][0] < 0.2 and
+                recent[-1][0] - recent[0][0] >= 0.25 and
+                all(all(value is not None and abs(value) <= cap
+                        for value, cap in zip(twist, (0.01, 0.01, 0.02))) for _, twist in recent))
 
     # ── timer ────────────────────────────────────────────────────────────────
 
@@ -717,6 +762,7 @@ class RosMotionIO:
 
         self._node = node
         self._results: dict = {}
+        self._cartesian = None
         drive_topic = ((config.get("plugins") or {}).get("base_drive") or {}).get("topic", "/cmd_vel_teleop")
         self._twist = node.create_publisher(Twist, drive_topic, reliable_qos)
         self._head = node.create_publisher(Float64MultiArray, self.HEAD_TOPIC, reliable_qos)
@@ -812,22 +858,66 @@ class RosMotionIO:
 
     def send_arm_goal(self, side: str, names: list, positions: list, duration_s: float):
         from builtin_interfaces.msg import Duration
-        from control_msgs.action import FollowJointTrajectory
         from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-        client = self._arm[side]
-        if not client.wait_for_server(timeout_sec=3.0):
-            raise RuntimeError(f"the {side} FollowJointTrajectory action server is unavailable")
         point = JointTrajectoryPoint()
         point.positions = [float(p) for p in positions]
         point.time_from_start = Duration(sec=int(duration_s), nanosec=int((duration_s % 1.0) * 1e9))
         trajectory = JointTrajectory()
         trajectory.joint_names, trajectory.points = list(names), [point]
+        return self.send_arm_trajectory(side, trajectory)
+
+    def send_arm_trajectory(self, side, trajectory, guard=None):
+        from control_msgs.action import FollowJointTrajectory
+
+        client = self._arm[side]
+        if not client.wait_for_server(timeout_sec=3.0):
+            raise RuntimeError(f"the {side} FollowJointTrajectory action server is unavailable")
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
-        handle = self._wait(client.send_goal_async(goal), 5.0)
+        if guard is not None:
+            guard()
+        future = client.send_goal_async(goal)
+        try:
+            handle = self._wait(future, 5.0)
+        except TimeoutError:
+            def cancel_late(finished):
+                handle = finished.result()
+                if handle is not None and handle.accepted:
+                    handle.cancel_goal_async()
+            future.add_done_callback(cancel_late)
+            raise
         if not handle.accepted:
             raise RuntimeError(f"the {side} trajectory goal was rejected")
         return handle
+
+    def cartesian_pick_path(self, config, current, point, orientation):
+        from geometry_msgs.msg import Pose
+        from moveit_msgs.srv import GetCartesianPath
+
+        if self._cartesian is None:
+            self._cartesian = self._node.create_client(
+                GetCartesianPath, config.get("cartesian_service", "/compute_cartesian_path"))
+        if not self._cartesian.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("MoveIt Cartesian path service is unavailable on the robot domain")
+        request = GetCartesianPath.Request()
+        request.header.frame_id = "base_link"
+        request.group_name, request.link_name = config["moveit_group"], config["tool_link"]
+        request.start_state.is_diff = True
+        request.start_state.joint_state.name = list(current)
+        request.start_state.joint_state.position = [float(value) for value in current.values()]
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = point
+        pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = orientation
+        request.waypoints = [pose]
+        request.max_step = 0.005
+        request.jump_threshold = 2.0
+        request.avoid_collisions = True
+        response = self._wait(self._cartesian.call_async(request), 5.0)
+        if response.error_code.val != 1 or not 0.999999 <= response.fraction <= 1.0:
+            raise RuntimeError(f"MoveIt did not return a complete collision-checked path ({response.fraction:.3f})")
+        if response.solution.multi_dof_joint_trajectory.points:
+            raise RuntimeError("tabletop_pick requires a fixed-base single-arm path")
+        return response.solution.joint_trajectory
 
     def poll_arm_result(self, handle, timeout_s: float):
         future = self._results.get(id(handle))
@@ -845,6 +935,17 @@ class RosMotionIO:
     def cancel_arm_goal(self, handle) -> None:
         self._results.pop(id(handle), None)
         handle.cancel_goal_async()
+
+    def cancel_pick_goal(self, handle) -> None:
+        try:
+            self._wait(handle.cancel_goal_async(), 2.0)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if self.poll_arm_result(handle, 0.2) is not None:
+                    return
+            raise TimeoutError("pick trajectory cancellation did not finish")
+        finally:
+            self._results.pop(id(handle), None)
 
 
 class PantherNodes:
@@ -929,12 +1030,13 @@ class PantherPlugin:
     PREFIX = "panther"
 
     def __init__(self, hub: Hub, nodes=None, sink=None, enabled=None, motion=None,
-                 camera=None, config=None):
+                 camera=None, config=None, pick=None):
         self._hub = hub
         self._nodes = nodes
         self._sink = sink
         self._motion = motion
         self._camera = camera
+        self._pick = pick
         self._config = config or {}
         self._enabled = tuple(c for c in CARD_ORDER if enabled is None or enabled.get(c, True))
 
@@ -942,6 +1044,10 @@ class PantherPlugin:
         tools = []
         motion_defs = {t["name"]: t for t in motion_tools(self._config)} if self._motion else {}
         for card in self._enabled:
+            if card == PICK_CARD:
+                if self._pick is not None:
+                    tools.append(self._pick.get_tool())
+                continue
             if card in MOTION_CARDS:
                 if card in motion_defs:
                     tools.append(motion_defs[card])
@@ -960,6 +1066,8 @@ class PantherPlugin:
 
     def stop(self) -> None:
         # Stop anything moving first, then release the hardware, then the ROS node and bridge.
+        if self._pick is not None:
+            self._pick.stop()
         if self._motion is not None:
             self._motion.stop_all()
         if self._camera is not None:
@@ -979,6 +1087,10 @@ class PantherPlugin:
             return {"urdf": self._hub.urdf(), "robot": "mh3"}
         if card not in self._enabled or card == "model":
             return {"state": "error", "message": f"unknown card {card!r}"}
+        if card == PICK_CARD and self._pick is not None:
+            return self._pick.dispatch(action, args)
+        if card == PICK_CARD:
+            return {"state": "error", "message": "tabletop_pick is unavailable"}
         if card in MOTION_CARDS:
             if self._motion is None:
                 return {"state": "error", "message": "motion is not available in this process"}
@@ -1025,4 +1137,9 @@ def build_plugins(config, namespace=None, ros2=None):
         frame_age=lambda kind: hub.stream("camera_" + kind)["last_data_age_s"])
     enabled = {name: bool(spec.get("enabled", True))
                for name, spec in (config.get("plugins") or {}).items()}
-    return [PantherPlugin(hub, nodes, sink, enabled, motion=motion, camera=camera, config=config)]
+    pick = None
+    if motion is not None and enabled.get(PICK_CARD):
+        pick = TabletopPick(config["plugins"][PICK_CARD], hub, motion,
+                            VopInput(bridge_config.get("profile", DEFAULT_PROFILE),
+                                     int(bridge_config.get("domain", 42))))
+    return [PantherPlugin(hub, nodes, sink, enabled, motion=motion, camera=camera, config=config, pick=pick)]

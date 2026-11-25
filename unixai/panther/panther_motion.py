@@ -207,6 +207,9 @@ class Motion:
         self._arm_cancel = threading.Event()
         self._arm_done = threading.Event()
         self._arm_done.set()
+        self._command_lock = threading.RLock()
+        self._pick_cancel = None
+        self._drive_until = 0.0
         self._stopped: set = set()
 
     # ── gate ─────────────────────────────────────────────────────────────────
@@ -238,7 +241,12 @@ class Motion:
         if action not in ("stop", "info", "check"):
             self._stopped.discard(card)
         try:
-            return handler(payload)
+            if action not in ("move", "set", "set_position", "look"):
+                return handler(payload)
+            with self._command_lock:
+                if self._pick_cancel is not None:
+                    raise RuntimeError("tabletop_pick owns the motion resources; stop it first")
+                return handler(payload)
         except (ValueError, RuntimeError, TimeoutError) as exc:
             return {"state": "error", "message": str(exc)}
 
@@ -283,6 +291,9 @@ class Motion:
                 print(f"[panther] stopping {card} failed: {type(exc).__name__}: {exc}", flush=True)
 
     def stop(self, card: str) -> dict:
+        pick_cancel = self._pick_cancel
+        if pick_cancel is not None:
+            pick_cancel.set()
         self._stopped.add(card)
         if card == "base_drive":
             return self._stop_drive()
@@ -302,6 +313,7 @@ class Motion:
         cap = self._plugins.get("base_drive") or {}
         with self._drive_lock:
             self._drive_generation += 1
+            self._drive_until = self._mono() + 0.5
         self._zero(int(cap.get("stop_repetitions", 5)), 0.0)
         return {"state": "idle"}
 
@@ -322,6 +334,7 @@ class Motion:
         with self._drive_lock:
             self._drive_generation += 1
             generation = self._drive_generation
+            self._drive_until = self._mono() + duration + 1.0
         action_id = f"panther_drive_{uuid4().hex[:8]}"
         self._spawn(lambda: self._drive_worker(generation, vx, vy, wz, duration, action_id, cap),
                     "panther-drive")
@@ -358,6 +371,121 @@ class Motion:
             except Exception:  # noqa: BLE001
                 pass
         self._notify(action_id, status, result, "base_drive")
+
+    def reserve_pick(self, cancel):
+        with self._command_lock:
+            self._gate()
+            if self._pick_cancel is not None or self._arm_running or self._mono() < self._drive_until:
+                raise RuntimeError("Panther is busy with another motion")
+            if any(not (self._plugins.get(card) or {}).get("enabled") for card in ("arm_control", "gripper")):
+                raise RuntimeError("tabletop_pick requires arm_control and gripper enabled")
+            self._pick_cancel = cancel
+
+    def release_pick(self, cancel):
+        with self._command_lock:
+            if self._pick_cancel is cancel:
+                self._pick_cancel = None
+
+    def pick_gripper(self, side, mode, position, opening, guard):
+        snapshot = self._check_gripper(side)
+        if not snapshot["fresh"] or snapshot["opening"] == "unknown":
+            raise RuntimeError("pick requires fresh calibrated gripper feedback")
+        self._require_active(GRIPPER_CONTROLLER.format(side=side))
+        guard()
+        self._gate()
+        sent = self._mono()
+        self._io.publish_gripper(side, mode, position)
+        while self._mono() - sent < 3.0:
+            guard()
+            self._gate()
+            sample = self._check_gripper(side)
+            if sample["fresh"] and sample["age_ms"] is not None and (
+                self._mono() - sample["age_ms"] / 1000 > sent + 0.1
+            ) and sample["opening"] in opening:
+                return
+            self._sleep(0.05)
+        raise RuntimeError("gripper did not report the expected position after the command")
+
+    def pick_move(self, side, config, point, orientation, guard, before_send=None):
+        guard()
+        self._gate()
+        current = self._state.joint_positions(max_age_s=0.5)
+        names = LEFT_ARM_JOINTS if side == "left" else RIGHT_ARM_JOINTS
+        if not current or any(name not in current for name in names):
+            raise RuntimeError("fresh feedback is required for all commanded arm joints")
+        trajectory = self._io.cartesian_pick_path(config, current, point, orientation)
+        limits, _ = self._state.joint_limits()
+        step = float(self._plugins["arm_control"]["max_target_delta_rad"])
+        ordered = list(trajectory.joint_names)
+        if len(ordered) != len(names) or set(ordered) != set(names) or not trajectory.points:
+            raise RuntimeError("MoveIt returned an empty trajectory or unexpected joints")
+        last = -1.0
+        previous = current
+        samples = []
+        slowdown = 1.0
+        for sample in trajectory.points:
+            seconds = sample.time_from_start.sec + sample.time_from_start.nanosec * 1e-9
+            if seconds <= last or not 0 <= seconds <= 12:
+                raise RuntimeError("invalid or too long Cartesian trajectory timing")
+            positions = validate_joint_target(ordered, list(sample.positions), limits, previous, step)
+            if last < 0 and max(abs(positions[i] - current[name]) for i, name in enumerate(ordered)) > 0.035:
+                raise RuntimeError("Cartesian trajectory does not start at the observed arm position")
+            if last >= 0:
+                delta = max(abs(positions[i] - previous[name]) for i, name in enumerate(ordered))
+                slowdown = max(slowdown, delta / (0.4 * (seconds - last)))
+            velocities = finite_vector(list(sample.velocities), "trajectory velocities", len(ordered)) if sample.velocities else []
+            accelerations = finite_vector(list(sample.accelerations), "trajectory accelerations", len(ordered)) if sample.accelerations else []
+            if sample.effort:
+                raise RuntimeError("Cartesian trajectory must not command effort")
+            slowdown = max(slowdown, max(map(abs, velocities), default=0.0) / 0.4)
+            samples.append((sample, seconds, velocities, accelerations))
+            previous = dict(zip(ordered, positions))
+            last = seconds
+        if last * slowdown > 16:
+            raise RuntimeError("Cartesian trajectory is too long at the tabletop joint-speed limit")
+        if last * slowdown < 0.15:
+            raise RuntimeError("Cartesian trajectory has no usable duration")
+        for sample, seconds, velocities, accelerations in samples:
+            sec, nsec = divmod(round(seconds * slowdown * 1e9), 1_000_000_000)
+            sample.time_from_start.sec, sample.time_from_start.nanosec = sec, nsec
+            sample.velocities = [value / slowdown for value in velocities]
+            sample.accelerations = [value / slowdown**2 for value in accelerations]
+        states = self._io.list_controllers()
+        controller = ARM_P2P_CONTROLLERS[side]
+        if controller not in states:
+            raise RuntimeError(f"controller {controller} does not exist on this robot")
+        switch = self._switch_plan(states, [controller])
+        self._switch_arm(switch, restore=False)
+        handle = None
+        completed = False
+        try:
+            def before_goal():
+                guard()
+                self._gate()
+                latest = self._state.joint_positions(max_age_s=0.5) or {}
+                if any(name not in latest or abs(latest[name] - current[name]) > 0.025 for name in current):
+                    raise RuntimeError("robot joint state changed while planning")
+                if before_send is not None:
+                    before_send()
+
+            handle = self._io.send_arm_trajectory(side, trajectory, guard=before_goal)
+            deadline = self._mono() + last * slowdown + 3
+            while self._mono() < deadline:
+                guard()
+                self._gate()
+                outcome = self._io.poll_arm_result(handle, 0.2)
+                if outcome is not None:
+                    if outcome.get("status") != 4 or outcome.get("error_code") != 0:
+                        raise RuntimeError(f"Cartesian trajectory failed: {outcome}")
+                    completed = True
+                    return
+            raise TimeoutError("Cartesian trajectory did not finish")
+        finally:
+            try:
+                if handle is not None and not completed:
+                    self._io.cancel_pick_goal(handle)
+            finally:
+                self._switch_arm(switch, restore=True)
 
     # ── arm_control ──────────────────────────────────────────────────────────
 

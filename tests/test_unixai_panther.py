@@ -277,7 +277,7 @@ def test_driver_config_and_cards_agree(device, config):
     assert [c["name"] for c in driver["cards"]] == list(device.CARD_ORDER)
     assert cards["model"] == "resource"
     assert {n for n, t in cards.items() if t == "actuator"} == {
-        "base_drive", "arm_control", "gripper", "lifting", "head"}
+        "base_drive", "arm_control", "gripper", "lifting", "head", "tabletop_pick"}
     assert {n for n, t in cards.items() if t == "sensor"} == set(device.SENSOR_CARDS) - {"model"}
     assert driver["port"] == config["mcp_port"] == 15747
     assert driver["mcp_url"] == "http://localhost:15747/mcp"
@@ -297,7 +297,8 @@ def test_port_is_not_used_by_another_driver():
 
 
 def test_tools_match_the_driver_manifest_and_use_renderable_formats(device, hub, motion, config):
-    tools = device.PantherPlugin(hub, motion=motion, config=config).get_tools()
+    pick = device.TabletopPick(config["plugins"]["tabletop_pick"], hub, motion, None)
+    tools = device.PantherPlugin(hub, motion=motion, config=config, pick=pick).get_tools()
     assert [t["name"] for t in tools] == list(device.CARD_ORDER)
     for definition in tools:
         assert definition["description"] and definition["inputSchema"]["type"] == "object"
@@ -2397,3 +2398,82 @@ def test_merging_keeps_the_nearest_return_where_two_lidars_overlap(payloads):
     assert merged["nearest_m"] == pytest.approx(1.0, abs=1e-3) and merged["beams"] == 720 and merged["bins"] == 360
     empty = strict(payloads.merge_scans([], "base_link", 360))
     assert set(empty["ranges"]) == {None} and empty["nearest_m"] is None and empty["valid_ratio"] == 0.0
+
+
+def test_tabletop_pick_uses_bbox_depth_and_camera_to_base_transform(device):
+    import numpy as np
+
+    pick = importlib.import_module("tabletop_pick")
+    setup = pick.load_setup({
+        "depth_aligned_to_color": True,
+        "color_intrinsics": [500, 500, 320, 240],
+        "color_size": [640, 480],
+        "base_from_color": [1, 0, 0, 0.1, 0, -1, 0, 0.2, 0, 0, -1, 1.5, 0, 0, 0, 1],
+        "workspace_m": [-1, -1, 0.2, 1, 1, 1],
+        "tool_orientation_xyzw": [1, 0, 0, 0],
+        "head_rad": [0, 0],
+        "lift_position": 0.6,
+        "clearance_m": 0.08,
+        "side": "right",
+        "moveit_group": "right_arm",
+        "tool_link": "gripper_tcp",
+    })
+    data = {"objects": [{"name": "bottle", "color": "bright red", "confidence": 0.9,
+                         "bbox": [350, 230, 390, 270]}]}
+    target = pick.select_object(data, "bottle", "red", 0.5)
+    depth = np.full((480, 640), 1000, dtype="<u2")
+    depth[250, 370] = 0
+    xyz, above = pick.grasp_points(target["bbox"], zlib.compress(depth.tobytes()), setup, -0.02)
+    assert xyz == pytest.approx([0.2, 0.18, 0.48])
+    assert above == pytest.approx([0.2, 0.18, 0.56])
+    with pytest.raises(ValueError, match="inconsistent depth"):
+        pick.grasp_points(target["bbox"], zlib.compress(bytes(depth.nbytes)), setup, 0)
+    data["objects"].append(target.copy())
+    with pytest.raises(ValueError, match="found 2"):
+        pick.select_object(data, "bottle", "red", 0.5)
+
+
+def test_tabletop_pick_missing_frame_identity_refuses_to_guess(hub):
+    with pytest.raises(ValueError, match="frame_sha256"):
+        hub.pick_frames(None, 1.0, 0.15)
+
+
+def test_tabletop_pick_lifecycle_sends_motion_only_on_confirmed_pick(device, config, hub, monkeypatch):
+    import threading
+
+    calls = []
+    completed = []
+    done = threading.Event()
+
+    def notify(*args):
+        completed.append(args)
+        done.set()
+
+    pick = device.TabletopPick(
+        config["plugins"]["tabletop_pick"], hub,
+        NS(reserve_pick=lambda cancel: calls.append("reserve"),
+           release_pick=lambda cancel: calls.append("release"),
+           pick_gripper=lambda side, mode, position, expected, guard: (guard(), calls.append(position)),
+           pick_move=lambda side, cfg, point, orientation, guard, before_send: (
+               guard(), before_send() if before_send else None, calls.append(point))),
+        NS(start=lambda topic: None, close=lambda: None), notify=notify,
+    )
+    module = importlib.import_module("tabletop_pick")
+    monkeypatch.setattr(module, "load_setup", lambda cfg: [None] * 5)
+    monkeypatch.setattr(pick, "_guard", lambda setup: None)
+    plan = {"object_name": "mouse", "point_m": [0.4, 0.0, 0.4], "above_m": [0.4, 0.0, 0.5],
+            "gripper_open": 1.0, "gripper_close": 0.0, "gripper_mode": "parallel",
+            "observed_at": module.time.monotonic()}
+    monkeypatch.setattr(pick, "_preview", lambda args: plan)
+    config["plugins"]["tabletop_pick"]["side"] = "right"
+    topic = hub.topics["camera_color"]["topic"] + "/objects"
+    assert pick.dispatch("start", {"input_topic": topic})["state"] == "ready"
+    assert pick.dispatch("preview", {"object_name": "mouse"})["point_m"] == plan["point_m"]
+    assert pick.dispatch("pick", {"object_name": "mouse"})["state"] == "error"
+    assert calls == []
+    response = pick.dispatch("pick", {"object_name": "mouse", "confirm_motion": True})
+    assert response["state"] == "picking"
+    assert done.wait(2)
+    assert completed[0][0:2] == (response["action_id"], "completed")
+    assert completed[0][2]["grasp_checked"] is False
+    assert calls == ["reserve", 1.0, plan["above_m"], plan["point_m"], 0.0, plan["above_m"], "release"]

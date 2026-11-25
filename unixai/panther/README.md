@@ -228,3 +228,44 @@ Open questions for the vendor (UniX AI): the gripper range and the lift unit; th
 naming and the head controller's joint order; what `/diagnostics` shows while the emergency stop is
 pressed; whether `/lidar_rear/scan` and `/scan` have a publisher; the lidars' frame names; the
 Gemini 2 camera's profile and intrinsics.
+
+## One-shot tabletop pick
+
+`tabletop_pick` is an actuator. Start both Panther camera cards and connect
+`camera_color -> VOP -> tabletop_pick` on the canvas. The actuator accesses
+registered depth from the same driver internally. Enable VOP `publish_bbox`.
+Deploy the VOP build that adds `frame_sha256` to stream results so the driver can
+associate detections with the exact JPEG. RGB and depth are paired using their
+original robot header timestamps.
+
+- `start` subscribes to VOP. `preview` uses `object_name` and optional `color` to
+  report a grasp point without moving. Use the exact emitted class, such as
+  `bottle` or `mouse`. Check the active vocabulary before commissioning a tissue
+  box, and configure its class only if it is detected reliably.
+- `pick` takes the same fields and `confirm_motion: true`, runs one grasp, and
+  reports completion via ACP. The sequence is open, move above the target,
+  descend, close, lift. It leaves the object in the gripper. `stop` stops the
+  sequence and cancels any arm trajectory in progress. A position command
+  already delivered to the gripper may continue at its controller.
+- `completed` confirms trajectory and gripper-position feedback. Inspect the
+  object after the lift. The result carries `grasp_checked: false`.
+  Use one matching object and a clear, commissioned tabletop cell.
+
+Configure the actual rectified color intrinsics (at the delivered image size),
+registered depth ROS source in `topics.camera_depth`, the camera-to-base
+transform at a fixed head/lift pose, workspace limits, side, tool orientation
+and per-class grasp profiles in `config.yaml`. Registered depth must correspond
+to the selected color image and use the same optical frame. Set
+`depth_aligned_to_color` only after verifying those properties on that device.
+Configure measured gripper feedback endpoints under `plugins.gripper`.
+No sample calibration or gripper positions are supplied.
+
+Run MoveIt on the robot ROS domain with the full Panther collision model,
+the selected 8-joint arm group, the calibrated TCP, current robot state,
+and the commissioned tabletop/workcell scene. The driver uses
+`GetCartesianPath` at `cartesian_service` and requires complete,
+collision-checked single-arm trajectories. The reduced skeleton URDF shipped
+with the driver lacks collision geometry and is unsuitable as the planning
+scene model. Calibrate the tool and workcell, verify preview points on a
+stationary robot, then verify each object profile under supervision before
+enabling motion. The bundled configuration keeps motion disabled.

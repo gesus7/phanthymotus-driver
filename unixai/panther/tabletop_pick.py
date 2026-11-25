@@ -1,10 +1,9 @@
 """One-shot tabletop pick from the Panther RGB-D cameras and an existing VOP stream."""
 from __future__ import annotations
 
+import http.client
 import json
-import multiprocessing
 import os
-import queue
 import threading
 import time
 import zlib
@@ -14,91 +13,70 @@ import numpy as np
 
 from common.vendor_runtime import tool
 from contracts import HEAD_JOINTS, finite_number, finite_vector, require_confirmation
-from panther_bridge import put_latest
 from panther_motion import GRIPPER_MODES, notify_async
 from panther_payloads import DEPTH_OUTPUT_SIZE
 
 CARD = "tabletop_pick"
 MAX_AGE_S = 1.0
 MAX_SKEW_S = 0.15
-VOP_LIMIT = 256 * 1024
+MAX_VOP_RESPONSE = 1024 * 1024
+MAX_OBSERVATION_AGE_S = 4.0
 
 
-def read_vop(profile, domain, topic, messages, stop):
-    """Subscribe on the core RMW in a separate process, as in the outbound bridge."""
-    if not os.path.isfile(profile):
-        return
-    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
-    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
-    import rclpy
-    from rclpy.node import Node
-    from rclpy.qos import qos_profile_sensor_data
-    from std_msgs.msg import String
+class VopSnapshot:
+    """Use Perception's existing upload and single-image VOP tools on loopback."""
 
-    rclpy.init(domain_id=domain)
-    node = Node("panther_tabletop_pick_vop")
+    def __init__(self, port=15720):
+        if type(port) is not int or not 1 <= port <= 65535:
+            raise ValueError("perception_port must be a valid TCP port")
+        self._port = port
 
-    def receive(msg):
-        if len(msg.data) <= VOP_LIMIT:
-            put_latest(messages, msg.data)
-
-    try:
-        node.create_subscription(String, topic, receive, qos_profile_sensor_data)
-        while rclpy.ok() and not stop.is_set():
-            rclpy.spin_once(node, timeout_sec=0.2)
-    finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
-
-
-class VopInput:
-    def __init__(self, profile, domain):
-        self._profile, self._domain = profile, domain
-        self._ctx = multiprocessing.get_context("spawn")
-        self._process = self._queue = self._stop = self._latest = None
-
-    def start(self, topic):
-        if self._process is not None and self._process.is_alive():
-            return
-        self.close()
-        if not os.path.isfile(self._profile):
-            raise RuntimeError("Panther core DDS profile is missing")
-        self._queue, self._stop = self._ctx.Queue(maxsize=2), self._ctx.Event()
-        self._process = self._ctx.Process(target=read_vop, daemon=True,
-                                         args=(self._profile, self._domain, topic, self._queue, self._stop))
+    def _post(self, path, body, headers):
+        connection = http.client.HTTPConnection("127.0.0.1", self._port, timeout=5)
         try:
-            self._process.start()
-        except Exception:
-            self._process = None
-            self.close()
-            raise
+            connection.request("POST", path, body, headers)
+            with connection.getresponse() as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Perception {path} returned HTTP {response.status}")
+                raw = response.read(MAX_VOP_RESPONSE + 1)
+                if len(raw) > MAX_VOP_RESPONSE:
+                    raise RuntimeError("Perception response is too large")
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("JSON object required")
+            return data
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            raise RuntimeError(f"Perception request failed at {path}") from exc
+        finally:
+            connection.close()
 
-    def latest(self):
-        if self._process is None or not self._process.is_alive():
-            return None
-        while True:
-            try:
-                self._latest = self._queue.get_nowait()
-            except queue.Empty:
-                break
+    def recognize(self, jpeg, confidence):
+        boundary = uuid4().hex
+        filename = f"panther-pick-{uuid4().hex}.jpg"
+        prefix = (f"--{boundary}\r\n"
+                  'Content-Disposition: form-data; name="subdir"\r\n\r\n'
+                  f"panther-tabletop-pick\r\n--{boundary}\r\n"
+                  f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                  "Content-Type: image/jpeg\r\n\r\n").encode()
+        headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+        token = os.environ.get("ACCESS_TOKEN", "").strip()
+        if token:
+            headers["X-Access-Token"] = token
+        upload = self._post("/file/upload", prefix + jpeg + f"\r\n--{boundary}--\r\n".encode(), headers)
+        path = upload.get("path")
+        if upload.get("ok") is not True or not isinstance(path, str) or not path.startswith("/"):
+            raise RuntimeError("Perception did not return an uploaded image path")
+        request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "vop", "arguments": {
+                       "action": "recognize_by_photo", "image_path": path, "confidence": confidence}}}
+        response = self._post("/mcp", json.dumps(request).encode(), {"Content-Type": "application/json"})
         try:
-            data = json.loads(self._latest)
-        except (TypeError, ValueError):
-            return None
-        return data if isinstance(data, dict) else None
-
-    def close(self):
-        if self._process is not None:
-            self._stop.set()
-            self._process.join(timeout=1.0)
-            if self._process.is_alive():
-                self._process.terminate()
-                self._process.join(timeout=1.0)
-            self._process.close()
-        if self._queue is not None:
-            self._queue.close()
-        self._process = self._queue = self._stop = self._latest = None
+            detection = json.loads(response["result"]["content"][0]["text"])
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError("Perception did not return a structured VOP result") from exc
+        if not isinstance(detection, dict) or detection.get("ok") is not True or detection.get("source") != path:
+            raise RuntimeError("VOP did not recognize the uploaded observation")
+        return detection
 
 
 def load_setup(config):
@@ -189,6 +167,7 @@ class TabletopPick:
         self._notify = notify
         self._lock = threading.Lock()
         self._started = False
+        self._generation = 0
         self._active = None
         self._last = None
         self._done = threading.Event()
@@ -208,11 +187,7 @@ class TabletopPick:
                          "preview": {"params": ["object_name", "color"]},
                          "pick": {"params": ["object_name", "color", "confirm_motion"]}},
                      "x-resource": ["base", "waist", "head", "arm_l", "arm_r", "hand_l", "hand_r"],
-                     "x-completion": {"actions": ["pick"], "timeout": 120}},
-                    topic_in=[{"format": "data/json", "desc": "同一 Panther camera_color 接入 VOP 后的 objects 流"}])
-
-    def _topic(self):
-        return self._hub.topics["camera_color"]["topic"] + "/objects"
+                     "x-completion": {"actions": ["pick"], "timeout": 120}})
 
     def _info(self):
         try:
@@ -221,7 +196,6 @@ class TabletopPick:
         except ValueError as exc:
             setup = str(exc)
         return {"state": "ready" if self._started else "idle",
-                "topic_in": [{**self.get_tool()["topic_in"][0], "topic": self._topic()}],
                 "calibration": setup, "busy": self._active is not None, "last_result": self._last}
 
     def dispatch(self, action, args):
@@ -232,39 +206,41 @@ class TabletopPick:
                 if action == "stop":
                     return self._stop()
                 if action == "start":
-                    topics = args.get("input_topics") or [args.get("input_topic")]
-                    if topics != [self._topic()]:
-                        raise ValueError("connect only VOP objects produced from this Panther camera_color")
                     if self._active is not None:
                         raise RuntimeError("pick is still active")
-                    self._vop.start(self._topic())
                     self._started = True
                     return self._info()
                 if action not in ("preview", "pick"):
                     raise ValueError(f"unknown action {action!r}")
                 if not self._started or self._active is not None:
                     raise RuntimeError("start tabletop_pick first and wait for any active pick to finish")
+                generation = self._generation
                 if action == "pick":
                     require_confirmation(args)
-                plan = self._preview(args)
-                if action == "preview":
-                    return {"state": "ready", **plan}
-                cancel = threading.Event()
-                self._motion.reserve_pick(cancel)
-                action_id = f"panther_pick_{uuid4().hex[:8]}"
-                self._active = cancel
-                self._done.clear()
-                try:
-                    threading.Thread(target=self._run, args=(action_id, plan, cancel),
-                                     name=CARD, daemon=True).start()
-                except Exception:
-                    self._active = None
-                    self._done.set()
-                    self._motion.release_pick(cancel)
-                    raise
-                return {"state": "picking", "action_id": action_id}
+                    return self._start_pick(args)
+            plan = self._preview(args)
+            with self._lock:
+                if generation != self._generation or self._active is not None:
+                    raise RuntimeError("preview was superseded")
+            return {"state": "ready", **plan}
         except (ValueError, RuntimeError, TimeoutError, zlib.error) as exc:
             return {"state": "error", "message": str(exc)}
+
+    def _start_pick(self, args):
+        cancel = threading.Event()
+        self._motion.reserve_pick(cancel)
+        action_id = f"panther_pick_{uuid4().hex[:8]}"
+        self._active = cancel
+        self._done.clear()
+        try:
+            threading.Thread(target=self._run, args=(action_id, dict(args), cancel),
+                             name=CARD, daemon=True).start()
+        except Exception:
+            self._active = None
+            self._done.set()
+            self._motion.release_pick(cancel)
+            raise
+        return {"state": "picking", "action_id": action_id}
 
     def _preview(self, args):
         setup = load_setup(self._config)
@@ -285,13 +261,16 @@ class TabletopPick:
                 0 <= closed <= 1 and opened != closed and mode in GRIPPER_MODES):
             raise ValueError("invalid confidence, tool offset or gripper settings")
         self._guard(setup)
-        data = self._vop.latest()
-        if not data:
-            raise ValueError("waiting for VOP results")
-        obj = select_object(data, name, color, confidence)
-        rgb, depth = self._hub.pick_frames(data.get("frame_sha256"), MAX_AGE_S, MAX_SKEW_S)
+        rgb, depth = self._hub.pick_frames(MAX_AGE_S, MAX_SKEW_S)
         if list(rgb["size"]) != setup[1] or rgb["frame"] != depth["frame"]:
             raise ValueError("RGB and registered depth must use the calibrated size and color optical frame")
+        data = self._vop.recognize(rgb["data"], confidence)
+        self._guard(setup)
+        if data.get("image_size") != list(rgb["size"]):
+            raise ValueError("VOP image dimensions differ from the calibrated observation")
+        if time.monotonic() - rgb["received"] > MAX_OBSERVATION_AGE_S:
+            raise RuntimeError("observation expired during VOP inference")
+        obj = select_object(data, name, color, confidence)
         point, above = grasp_points(obj.get("bbox"), depth["data"], setup, offset)
         return {"object_name": name, "color": color, "bbox": obj["bbox"], "point_m": point, "above_m": above,
                 "gripper_open": opened, "gripper_close": closed, "gripper_mode": mode,
@@ -307,9 +286,8 @@ class TabletopPick:
         if not self._hub.pick_base_still():
             raise RuntimeError("wait for fresh, stationary base odometry")
 
-    def _run(self, action_id, plan, cancel):
-        result = {"object_name": plan["object_name"], "point_m": plan["point_m"],
-                  "grasp_checked": False, "stage": "plan_pregrasp"}
+    def _run(self, action_id, args, cancel):
+        result = {"grasp_checked": False, "stage": "observe"}
         status = "error"
         closed = False
         attempted_grip = False
@@ -327,15 +305,16 @@ class TabletopPick:
                 self._motion.pick_move(side, self._config, point, setup[4], guard, before_send)
 
             def check_target():
-                with self._lock:
-                    guard()
-                    fresh = self._preview(plan)
+                guard()
+                fresh = self._preview(args)
+                guard()
                 if np.linalg.norm(np.subtract(plan["point_m"], fresh["point_m"])) > 0.015:
                     raise RuntimeError("target moved since preview; request another pick")
 
             guard()
-            if time.monotonic() - plan["observed_at"] > MAX_AGE_S:
-                raise RuntimeError("observation expired before motion")
+            plan = self._preview(args)
+            guard()
+            result.update(object_name=plan["object_name"], point_m=plan["point_m"], stage="open")
             self._motion.pick_gripper(side, plan["gripper_mode"], plan["gripper_open"], {"open"}, guard)
             move("pregrasp", plan["above_m"], check_target)
             move("descend", plan["point_m"])
@@ -360,9 +339,9 @@ class TabletopPick:
 
     def _stop(self):
         self._started = False
+        self._generation += 1
         if self._active is not None:
             self._active.set()
-        self._vop.close()
         return {"state": "stopping" if self._active is not None else "idle"}
 
     def stop(self):

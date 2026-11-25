@@ -2433,9 +2433,38 @@ def test_tabletop_pick_uses_bbox_depth_and_camera_to_base_transform(device):
         pick.select_object(data, "bottle", "red", 0.5)
 
 
-def test_tabletop_pick_missing_frame_identity_refuses_to_guess(hub):
-    with pytest.raises(ValueError, match="frame_sha256"):
-        hub.pick_frames(None, 1.0, 0.15)
+def test_tabletop_pick_selects_a_fresh_synchronized_pair(hub, clock):
+    for camera in ("camera_color", "camera_depth"):
+        hub.activate(camera)
+    color = {"received": clock.mono - 0.1, "stamp": 1000, "frame": "color_optical", "data": b"jpeg"}
+    depth = {**color, "stamp": 1010, "data": b"depth"}
+    hub._pick_frames["camera_color"].extend([color, {**color, "stamp": 1200, "data": b"late"}])
+    hub._pick_frames["camera_depth"].append(depth)
+    assert hub.pick_frames(1.0, 0.15) == (color, depth)
+    clock.advance(2)
+    with pytest.raises(ValueError, match="no fresh synchronized"):
+        hub.pick_frames(1.0, 0.15)
+
+
+def test_tabletop_pick_calls_existing_vop_on_the_uploaded_jpeg(device, monkeypatch):
+    client = device.VopSnapshot()
+    jpeg = b"test-jpeg"
+    path = "/models/uploads/2026-11-25/panther-tabletop-pick/test.jpg"
+    calls = []
+
+    def post(endpoint, body, headers):
+        calls.append(endpoint)
+        if endpoint == "/file/upload":
+            assert b"\r\n\r\n" + jpeg + b"\r\n" in body
+            assert headers["Content-Type"].startswith("multipart/form-data; boundary=")
+            return {"ok": True, "path": path}
+        assert json.loads(body)["params"] == {
+            "name": "vop", "arguments": {"action": "recognize_by_photo", "image_path": path, "confidence": 0.5}}
+        return {"result": {"content": [{"text": json.dumps({"ok": True, "source": path, "objects": []})}]}}
+
+    monkeypatch.setattr(client, "_post", post)
+    assert client.recognize(jpeg, 0.5)["objects"] == []
+    assert calls == ["/file/upload", "/mcp"]
 
 
 def test_tabletop_pick_lifecycle_sends_motion_only_on_confirmed_pick(device, config, hub, monkeypatch):
@@ -2456,7 +2485,7 @@ def test_tabletop_pick_lifecycle_sends_motion_only_on_confirmed_pick(device, con
            pick_gripper=lambda side, mode, position, expected, guard: (guard(), calls.append(position)),
            pick_move=lambda side, cfg, point, orientation, guard, before_send: (
                guard(), before_send() if before_send else None, calls.append(point))),
-        NS(start=lambda topic: None, close=lambda: None), notify=notify,
+        None, notify=notify,
     )
     module = importlib.import_module("tabletop_pick")
     monkeypatch.setattr(module, "load_setup", lambda cfg: [None] * 5)
@@ -2466,8 +2495,7 @@ def test_tabletop_pick_lifecycle_sends_motion_only_on_confirmed_pick(device, con
             "observed_at": module.time.monotonic()}
     monkeypatch.setattr(pick, "_preview", lambda args: plan)
     config["plugins"]["tabletop_pick"]["side"] = "right"
-    topic = hub.topics["camera_color"]["topic"] + "/objects"
-    assert pick.dispatch("start", {"input_topic": topic})["state"] == "ready"
+    assert pick.dispatch("start", {})["state"] == "ready"
     assert pick.dispatch("preview", {"object_name": "mouse"})["point_m"] == plan["point_m"]
     assert pick.dispatch("pick", {"object_name": "mouse"})["state"] == "error"
     assert calls == []

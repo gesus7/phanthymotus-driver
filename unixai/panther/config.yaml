@@ -147,6 +147,7 @@ plugins:
     moveit_group: null
     tool_link: null             # calibrated gripper TCP link in the planning scene
     cartesian_service: /compute_cartesian_path
+    perception_port: 15720       # same-host Perception HTTP service
     min_confidence: 0.50
     # Key by exact VOP class, e.g. bottle or mouse. Each entry needs
     # surface_to_tcp_z_m, gripper_open, and gripper_close; gripper_mode defaults to parallel.

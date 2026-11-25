@@ -15,7 +15,6 @@ listed and answer `info`, and every motion command is refused.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -30,7 +29,7 @@ from contracts import parse_joint_limits, populate_switch_request
 from host_camera import HostCamera
 from panther_bridge import CoreBridge, DEFAULT_PROFILE, safe_text
 from panther_motion import MOTION_CARDS, Motion, motion_tools
-from tabletop_pick import CARD as PICK_CARD, TabletopPick, VopInput
+from tabletop_pick import CARD as PICK_CARD, TabletopPick, VopSnapshot
 from panther_payloads import (
     DEPTH_FORMAT, DEPTH_OUTPUT_SIZE, StaticTf, UnsupportedImage, battery_payload, diagnostic_entries,
     encode_color_jpeg, encode_depth_zlib, estop_payload, health_payload, imu_payload,
@@ -591,31 +590,28 @@ class Hub:
         stamp = stamp_ms(getattr(msg, "header", None))
         if self._pick_enabled and stamp is not None:
             sample = {"received": received, "stamp": stamp, "size": size, "frame": frame_id,
-                      "sha256": hashlib.sha256(data).hexdigest() if card == "camera_color" else None,
-                      "data": data if card == "camera_depth" else None}
+                      "data": data}
             with self._lock:
                 self._pick_frames[card].append(sample)
         self._emit_image(card, card, self.topics[card]["topic"], image_format, data, frame_id)
 
-    def pick_frames(self, digest, max_age, max_skew):
-        if not isinstance(digest, str) or len(digest) != 64:
-            raise ValueError("streaming VOP must include frame_sha256")
+    def pick_frames(self, max_age, max_skew):
         if not all(self.is_active(card) for card in CAMERA_CARDS):
             raise ValueError("start both Panther camera cards before tabletop_pick")
         with self._lock:
             now = self._mono()
-            rgb = next((sample for sample in reversed(self._pick_frames["camera_color"])
-                        if sample["sha256"] == digest and now - sample["received"] <= max_age), None)
-            candidates = [sample for sample in self._pick_frames["camera_depth"]
-                          if now - sample["received"] <= max_age]
-        if rgb is None or not candidates:
-            raise ValueError("no fresh RGB-D observation matches VOP")
-        depth = min(candidates, key=lambda sample: abs(sample["stamp"] - rgb["stamp"]))
-        if (abs(depth["stamp"] - rgb["stamp"]) > max_skew * 1000
-                or abs(depth["received"] - rgb["received"]) > max_skew
-                or not rgb["frame"]):
-            raise ValueError("no synchronized and stamped depth frame matches VOP")
-        return rgb, depth
+            colors = [sample for sample in reversed(self._pick_frames["camera_color"])
+                      if sample["frame"] and now - sample["received"] <= max_age]
+            depths = [sample for sample in self._pick_frames["camera_depth"]
+                      if now - sample["received"] <= max_age]
+        for rgb in colors:
+            candidates = [depth for depth in depths
+                          if depth["frame"] == rgb["frame"]
+                          and abs(depth["stamp"] - rgb["stamp"]) <= max_skew * 1000
+                          and abs(depth["received"] - rgb["received"]) <= max_skew]
+            if candidates:
+                return rgb, min(candidates, key=lambda depth: abs(depth["stamp"] - rgb["stamp"]))
+        raise ValueError("no fresh synchronized RGB-D observation in the color optical frame")
 
     def pick_base_still(self):
         with self._lock:
@@ -1139,7 +1135,6 @@ def build_plugins(config, namespace=None, ros2=None):
                for name, spec in (config.get("plugins") or {}).items()}
     pick = None
     if motion is not None and enabled.get(PICK_CARD):
-        pick = TabletopPick(config["plugins"][PICK_CARD], hub, motion,
-                            VopInput(bridge_config.get("profile", DEFAULT_PROFILE),
-                                     int(bridge_config.get("domain", 42))))
+        pick_config = config["plugins"][PICK_CARD]
+        pick = TabletopPick(pick_config, hub, motion, VopSnapshot(pick_config.get("perception_port", 15720)))
     return [PantherPlugin(hub, nodes, sink, enabled, motion=motion, camera=camera, config=config, pick=pick)]

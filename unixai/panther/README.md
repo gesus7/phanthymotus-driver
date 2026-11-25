@@ -231,14 +231,15 @@ Gemini 2 camera's profile and intrinsics.
 
 ## One-shot tabletop pick
 
-`tabletop_pick` is an actuator. Start both Panther camera cards and connect
-`camera_color -> VOP -> tabletop_pick` on the canvas. The actuator accesses
-registered depth from the same driver internally. Enable VOP `publish_bbox`.
-Deploy the VOP build that adds `frame_sha256` to stream results so the driver can
-associate detections with the exact JPEG. RGB and depth are paired using their
-original robot header timestamps.
+`tabletop_pick` is an actuator. Start both Panther camera cards on the canvas.
+The actuator locks one RGB-D pair using the original robot header timestamps,
+uploads that JPEG to local Perception and calls the existing VOP
+`recognize_by_photo` action. The depth snapshot stays in the driver. Perception
+uses its existing upload retention settings for the snapshots. If upload
+authentication is enabled, pass the matching `ACCESS_TOKEN` to the Panther
+container.
 
-- `start` subscribes to VOP. `preview` uses `object_name` and optional `color` to
+- `start` prepares the card. `preview` uses `object_name` and optional `color` to
   report a grasp point without moving. Use the exact emitted class, such as
   `bottle` or `mouse`. Check the active vocabulary before commissioning a tissue
   box, and configure its class only if it is detected reliably.

@@ -462,11 +462,12 @@ class Motion:
             def before_goal():
                 guard()
                 self._gate()
+                if before_send is not None:
+                    before_send()
+                    self._gate()
                 latest = self._state.joint_positions(max_age_s=0.5) or {}
                 if any(name not in latest or abs(latest[name] - current[name]) > 0.025 for name in current):
                     raise RuntimeError("robot joint state changed while planning")
-                if before_send is not None:
-                    before_send()
 
             handle = self._io.send_arm_trajectory(side, trajectory, guard=before_goal)
             deadline = self._mono() + last * slowdown + 3
